@@ -25,7 +25,7 @@ blueprint:
     5 Minuten sowie sofort bei einer Phasenlast über 9.000 W.
     Hysterese verhindert Flattern bei schwankenden Lasten.
   domain: automation
-  source_url: "https://github.com/Nebukadneczar/Home-Assitant-Lastverteilung-Drei-Phasen-Miner"
+  source_url: "https://github.com/Nebukadneczar/Home-Assistant-Lastverteilung-Drei-Phasen-Miner"
   input:
 
     phase_a_sensor:
