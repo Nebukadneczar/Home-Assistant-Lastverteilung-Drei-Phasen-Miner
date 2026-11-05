@@ -1,4 +1,4 @@
-# Version: 1.0.0
+# Version: 1.1.0
 # Home Assistant – Lastverteilung Drei-Phasen-Miner
 #
 # Regelt einen Miner anhand der Gesamtlast seiner zugeordneten Phase.
@@ -8,19 +8,22 @@
 # Grundlast = Phasenleistung - aktuelles Miner-Power-Target
 # verfügbar = Phasengrenzwert - Grundlast - Sicherheitsreserve
 #
-# Hinweis:
-# In v1.0.0 wird das aktuelle Miner-Power-Target als Mineranteil
-# an der Phasenleistung verwendet. Ein separater Ist-Leistungssensor
-# des Miners ist daher nicht erforderlich.
+# v1.1.0 Änderungen:
+# - mode: single statt restart (stabilere Ausführung)
+# - max_exceeded: log statt silent (bessere Fehlersichtbarkeit)
+# - Hysterese: Erhöhung erst wenn Phase deutlich unter Limit
+# - Nur Trigger auf der Miner-Phase (keine unnötigen Ausführungen)
+# - Konfigurierbare Hysterese-Schwelle
 
 blueprint:
   name: "Miner – Lastverteilung Drei Phasen 9 kW"
   description: >
     Begrenzt die Gesamtlast der Phase, an der ein ausgewählter Miner hängt,
-    auf maximal 9.000 W. Überwacht Phase A, B und C, berechnet aus der
+    auf maximal 9.000 W. Überwacht die Phasenlast, berechnet aus der
     Phasenlast und dem aktuellen Miner-Power-Target die zulässige Minerleistung
     und setzt das Power Target entsprechend. Prüfung standardmäßig alle
     5 Minuten sowie sofort bei einer Phasenlast über 9.000 W.
+    Hysterese verhindert Flattern bei schwankenden Lasten.
   domain: automation
   source_url: "https://github.com/Nebukadneczar/Home-Assitant-Lastverteilung-Drei-Phasen-Miner"
   input:
@@ -115,6 +118,21 @@ blueprint:
           mode: box
           unit_of_measurement: W
 
+    hysterese_threshold:
+      name: Hysterese-Schwelle
+      description: >
+        Miner wird erst wieder erhöht, wenn die Phasenlast unter
+        (Phasengrenzwert - Sicherheitsreserve - Hysterese) fällt.
+        Verhindert Flattern bei schwankenden Lasten.
+      default: 500
+      selector:
+        number:
+          min: 0
+          max: 3000
+          step: 100
+          mode: box
+          unit_of_measurement: W
+
     evaluation_interval:
       name: Prüfintervall
       description: Zeit zwischen normalen Prüfungen.
@@ -138,25 +156,25 @@ blueprint:
       selector:
         text:
 
-mode: restart
-max_exceeded: silent
+mode: single
+max_exceeded: log
 
 trigger:
   - platform: time_pattern
     minutes: !input evaluation_interval
     id: zyklus
 
+  # Nur Trigger auf der Phase, an der der Miner hängt
   - platform: state
-    entity_id: !input phase_a_sensor
-    id: phase_a_aenderung
-
-  - platform: state
-    entity_id: !input phase_b_sensor
-    id: phase_b_aenderung
-
-  - platform: state
-    entity_id: !input phase_c_sensor
-    id: phase_c_aenderung
+    entity_id: >-
+      {% if miner_phase == 'A' %}
+        {{ phase_a_sensor }}
+      {% elif miner_phase == 'B' %}
+        {{ phase_b_sensor }}
+      {% else %}
+        {{ phase_c_sensor }}
+      {% endif %}
+    id: miner_phase_aenderung
 
 condition: []
 
@@ -171,7 +189,9 @@ action:
       configured_limit: !input phase_limit
       configured_margin: !input safety_margin
       configured_step: !input change_step
+      configured_hysteresis: !input hysterese_threshold
 
+      # Aktuelle Phasenleistung der Miner-Phase
       phase_power: >-
         {% if selected_phase == 'A' %}
           {{ states(phase_a) | float(0) }}
@@ -181,28 +201,45 @@ action:
           {{ states(phase_c) | float(0) }}
         {% endif %}
 
+      # Aktuelles Miner-Power-Target
       current_target: "{{ states(target_entity) | float(0) }}"
 
+      # Grundlast = Phasenleistung - Miner-Target
       base_load: >-
         {{ [phase_power - current_target, 0] | max }}
 
+      # Verfügbare Leistung für den Miner
       available_power_raw: >-
         {{ configured_limit - base_load - configured_margin }}
 
+      # Begrenzt auf maximale Minerleistung
       available_power: >-
         {{ [available_power_raw, configured_max] | min | max(0) }}
 
+      # Auf Änderungsstufe gerundet
       rounded_power: >-
         {{ ((available_power / configured_step) | round(0, 'floor')) * configured_step }}
 
+      # Neues Ziel, begrenzt auf Max
       new_target: >-
         {{ [rounded_power, configured_max] | min | max(0) | int }}
 
+      # Hysterese: Miner wird erst erhöht, wenn Phase deutlich unter Limit
+      hysteresis_limit: >-
+        {{ configured_limit - configured_margin - configured_hysteresis }}
+
+      # Soll der Miner erhöht werden dürfen?
+      can_increase: >-
+        {% if phase_power < hysteresis_limit %}true{% else %}false{% endif %}
+
+      # Über dem Grenzwert?
       over_limit: "{{ phase_power > configured_limit }}"
 
+      # Unterschied zwischen neuem und aktuellem Target
       target_difference: >-
         {{ (new_target - current_target) | abs }}
 
+  # Sofortreaktion: Phase über Grenzwert
   - choose:
       - conditions:
           - condition: template
@@ -217,15 +254,24 @@ action:
           - service: persistent_notification.create
             data:
               notification_id: !input notification_id
-              title: "Drei-Phasen-Lastverteilung"
+              title: "⚠️ Drei-Phasen-Lastverteilung"
               message: >-
-                Phase {{ selected_phase }} über dem Grenzwert:
+                Phase {{ selected_phase }} ÜBER dem Grenzwert:
                 {{ phase_power | round(0) }} W.
                 Miner-Ziel auf {{ new_target }} W gesetzt.
 
+      # Normale Anpassung: Unterschied >= Änderungsstufe
+      # UND Hysterese erlaubt Erhöhung
       - conditions:
           - condition: template
             value_template: "{{ target_difference >= configured_step }}"
+          - condition: template
+            value_template: >-
+              {% if new_target > current_target %}
+                {{ can_increase }}
+              {% else %}
+                true
+              {% endif %}
         sequence:
           - service: number.set_value
             target:
@@ -236,13 +282,14 @@ action:
           - service: persistent_notification.create
             data:
               notification_id: !input notification_id
-              title: "Drei-Phasen-Lastverteilung"
+              title: "🔄 Drei-Phasen-Lastverteilung"
               message: >-
                 Phase {{ selected_phase }}:
                 {{ phase_power | round(0) }} W Gesamtlast.
                 Miner-Ziel: {{ current_target | round(0) }} W →
                 {{ new_target }} W.
 
+      # Warnung: Phase nähert sich dem Grenzwert
       - conditions:
           - condition: template
             value_template: "{{ phase_power | float(0) >= configured_limit - configured_margin }}"
@@ -250,7 +297,7 @@ action:
           - service: persistent_notification.create
             data:
               notification_id: !input notification_id
-              title: "Drei-Phasen-Lastverteilung"
+              title: "⚡ Drei-Phasen-Lastverteilung"
               message: >-
                 Phase {{ selected_phase }} nähert sich dem Grenzwert:
                 {{ phase_power | round(0) }} W von {{ configured_limit | round(0) }} W.
